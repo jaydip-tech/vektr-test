@@ -7,10 +7,17 @@ into Jira updates while keeping idempotency and security concerns explicit.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional
 import re
+from typing import Any, Dict, Iterable, List, Mapping, Sequence
 
 JIRA_KEY_PATTERN = re.compile(r"\b([A-Z][A-Z0-9]+-\d+)\b")
+SAFE_STATUS_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9 _-]{1,48}$")
+DEFAULT_EVENT_STATUS_MAP: Dict[str, str] = {
+    "pull_request_merged": "Done",
+    "deployment_succeeded": "Done",
+    "pull_request_opened": "In Progress",
+    "branch_created": "In Progress",
+}
 
 
 @dataclass(frozen=True)
@@ -67,6 +74,13 @@ class MockJiraClient(JiraClient):
         return payload
 
 
+def _normalize_issue_key(value: object) -> str | None:
+    if value is None:
+        return None
+    candidate = str(value).strip().upper()
+    return candidate if JIRA_KEY_PATTERN.fullmatch(candidate) else None
+
+
 def extract_jira_keys(event: DevEvent) -> List[str]:
     candidates: List[str] = []
     text_sources: Iterable[str] = [
@@ -77,9 +91,18 @@ def extract_jira_keys(event: DevEvent) -> List[str]:
     ]
     for text in text_sources:
         candidates.extend(match.group(1) for match in JIRA_KEY_PATTERN.finditer(text or ""))
-    metadata_key = event.metadata.get("jira_key")
+
+    metadata_key = _normalize_issue_key(event.metadata.get("jira_key"))
     if metadata_key:
-        candidates.append(str(metadata_key))
+        candidates.append(metadata_key)
+
+    metadata_keys = event.metadata.get("jira_keys")
+    if isinstance(metadata_keys, Sequence) and not isinstance(metadata_keys, (str, bytes, bytearray)):
+        for key in metadata_keys:
+            normalized = _normalize_issue_key(key)
+            if normalized:
+                candidates.append(normalized)
+
     deduped: List[str] = []
     seen: set[str] = set()
     for key in candidates:
@@ -101,21 +124,54 @@ def summarize_event(event: DevEvent) -> str:
     return " | ".join(details)
 
 
-def map_event_to_actions(event: DevEvent) -> List[Dict[str, Any]]:
-    event_type = event.event_type.lower()
+def build_idempotency_key(event: DevEvent) -> str:
+    parts = [
+        event.event_type.strip().lower(),
+        event.title.strip(),
+        event.branch.strip(),
+        "|".join(message.strip() for message in event.commit_messages),
+        event.pr_body.strip(),
+        str(event.metadata.get("delivery_id", "")).strip(),
+    ]
+    return ":".join(parts)
+
+
+def _get_status_for_event(event_type: str, status_map: Mapping[str, str]) -> str | None:
+    status = status_map.get(event_type.lower())
+    if not status:
+        return None
+    cleaned_status = status.strip()
+    if not SAFE_STATUS_PATTERN.fullmatch(cleaned_status):
+        raise ValueError(f"Unsafe Jira status configured for event type: {event_type}")
+    return cleaned_status
+
+
+def map_event_to_actions(
+    event: DevEvent,
+    status_map: Mapping[str, str] | None = None,
+) -> List[Dict[str, Any]]:
+    resolved_status_map = dict(DEFAULT_EVENT_STATUS_MAP)
+    if status_map:
+        resolved_status_map.update(status_map)
+
     actions: List[Dict[str, Any]] = [{"type": "comment", "body": summarize_event(event)}]
-    if event_type in {"pull_request_merged", "deployment_succeeded"}:
-        actions.append({"type": "transition", "status": "Done"})
+    status = _get_status_for_event(event.event_type, resolved_status_map)
+    if status:
+        actions.append({"type": "transition", "status": status})
+    if event.event_type.lower() in {"pull_request_merged", "deployment_succeeded"}:
         actions.append({"type": "fields", "fields": {"labels": ["auto-updated"]}})
-    elif event_type in {"pull_request_opened", "branch_created"}:
-        actions.append({"type": "transition", "status": "In Progress"})
-    elif event_type in {"test_failed", "deployment_failed"}:
+    if event.event_type.lower() in {"test_failed", "deployment_failed"}:
         actions.append({"type": "comment", "body": "Automation detected a failed validation step."})
     return actions
 
 
-def process_event(event: DevEvent, jira_client: JiraClient, store: IdempotencyStore) -> List[Dict[str, Any]]:
-    dedupe_key = f"{event.event_type}:{event.title}:{event.branch}:{'|'.join(event.commit_messages)}"
+def process_event(
+    event: DevEvent,
+    jira_client: JiraClient,
+    store: IdempotencyStore,
+    status_map: Mapping[str, str] | None = None,
+) -> List[Dict[str, Any]]:
+    dedupe_key = build_idempotency_key(event)
     if store.seen(dedupe_key):
         return []
 
@@ -125,7 +181,7 @@ def process_event(event: DevEvent, jira_client: JiraClient, store: IdempotencySt
 
     issue_key = keys[0]
     applied: List[Dict[str, Any]] = []
-    for action in map_event_to_actions(event):
+    for action in map_event_to_actions(event, status_map=status_map):
         if action["type"] == "transition":
             applied.append(jira_client.transition_issue(issue_key, action["status"]))
         elif action["type"] == "comment":
